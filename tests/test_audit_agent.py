@@ -67,6 +67,69 @@ class TestExtractSummary:
 
 
 class TestExtractAnomalies:
+    # --- JSON block parsing (primary path) ---
+
+    def test_parses_valid_json_block(self) -> None:
+        response = (
+            "Some markdown report.\n\n"
+            "```json\n"
+            '[{"severity": "critical", "document_type": "rent_roll", '
+            '"affected": "Unit 101", "description": "Rent is zero.", '
+            '"recommended_action": "Fix it."}]\n'
+            "```"
+        )
+        anomalies = AuditAgent._extract_anomalies(response)
+        assert len(anomalies) == 1
+        assert anomalies[0]["severity"] == "critical"
+        assert anomalies[0]["document_type"] == "rent_roll"
+        assert anomalies[0]["affected"] == "Unit 101"
+        assert anomalies[0]["description"] == "Rent is zero."
+        assert anomalies[0]["recommended_action"] == "Fix it."
+
+    def test_parses_multiple_json_anomalies(self) -> None:
+        response = (
+            "Report text.\n\n"
+            "```json\n"
+            '[{"severity": "high", "document_type": "projections", "affected": "Jan", '
+            '"description": "Variance >25%.", "recommended_action": "Investigate."},'
+            ' {"severity": "low", "document_type": "concessions", "affected": "Unit 5", '
+            '"description": "Missing reason.", "recommended_action": "Add notes."}]\n'
+            "```"
+        )
+        anomalies = AuditAgent._extract_anomalies(response)
+        assert len(anomalies) == 2
+        severities = {a["severity"] for a in anomalies}
+        assert severities == {"high", "low"}
+
+    def test_returns_empty_list_for_empty_json_array(self) -> None:
+        response = "All clear.\n\n```json\n[]\n```"
+        anomalies = AuditAgent._extract_anomalies(response)
+        assert anomalies == []
+
+    def test_skips_items_with_invalid_severity_in_json(self) -> None:
+        response = (
+            "```json\n"
+            '[{"severity": "unknown", "document_type": "rent_roll", '
+            '"affected": "X", "description": "Bad.", "recommended_action": "None."}]\n'
+            "```"
+        )
+        anomalies = AuditAgent._extract_anomalies(response)
+        assert anomalies == []
+
+    def test_handles_malformed_json_gracefully_via_fallback(self) -> None:
+        # Malformed JSON → should not raise; falls back to keyword matching
+        response = (
+            "```json\n"
+            "[{broken json\n"
+            "```\n"
+            "- **high** — some issue."
+        )
+        anomalies = AuditAgent._extract_anomalies(response)
+        # Fallback should pick up the bold keyword
+        assert any(a["severity"] == "high" for a in anomalies)
+
+    # --- Fallback keyword matching ---
+
     def test_detects_bold_severity_keywords(self) -> None:
         response = (
             "- Unit 101: **critical** — rent is zero.\n"
@@ -119,6 +182,25 @@ Critical issue requires immediate attention.
 
 ## Recommended Actions
 Fix rent for Unit 101.
+
+```json
+[
+  {
+    "severity": "critical",
+    "document_type": "rent_roll",
+    "affected": "Unit 101",
+    "description": "Monthly rent is $0 — possible data error.",
+    "recommended_action": "Verify rent amount and tenant status for Unit 101."
+  },
+  {
+    "severity": "medium",
+    "document_type": "rent_roll",
+    "affected": "Unit 202",
+    "description": "Lease end date is in the past but unit is still marked occupied.",
+    "recommended_action": "Confirm lease renewal or update occupancy status."
+  }
+]
+```
 """
 
 
@@ -157,8 +239,13 @@ class TestAuditAgentRun:
             concessions_content="",
         )
 
-        assert len(result.anomalies) >= 1
+        assert len(result.anomalies) == 2  # parsed from JSON block
         assert any(a["severity"] == "critical" for a in result.anomalies)
+        # Richer fields should be present when JSON path is taken
+        critical = next(a for a in result.anomalies if a["severity"] == "critical")
+        assert critical["document_type"] == "rent_roll"
+        assert critical["affected"] == "Unit 101"
+        assert "recommended_action" in critical
 
     @patch("agents.audit_agent.create_react_agent")
     def test_run_extracts_summary(self, mock_create_agent: MagicMock) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -201,7 +202,32 @@ For each anomaly you discover, classify it with a severity level:
 - **medium**: Notable issue that should be investigated
 - **low**: Minor discrepancy or best-practice violation
 
-Be thorough, precise, and professional. Format your final report in clear markdown."""
+Be thorough, precise, and professional. Format your final report in clear markdown.
+
+IMPORTANT — Structured anomaly output:
+After your full markdown report, append a fenced JSON code block containing every
+anomaly as a list of objects.  The block MUST follow this exact schema:
+
+```json
+[
+  {
+    "severity": "critical",
+    "document_type": "rent_roll",
+    "affected": "Unit 101",
+    "description": "Monthly rent is $0 — possible data error.",
+    "recommended_action": "Verify rent amount and tenant status for Unit 101."
+  }
+]
+```
+
+Rules for the JSON block:
+- "severity" must be one of: "critical", "high", "medium", "low"
+- "document_type" must be one of: "rent_roll", "projections", "concessions", "general"
+- "affected" identifies the unit, row, or period involved
+- "description" is a concise explanation of the anomaly
+- "recommended_action" is a concrete next step
+- If no anomalies are found, output an empty array: ```json\n[]\n```
+- Output ONLY ONE json code block, placed at the very end of your response."""
 
 
 class AuditAgent:
@@ -328,13 +354,61 @@ class AuditAgent:
 
     @staticmethod
     def _extract_anomalies(response: str) -> list[dict[str, Any]]:
-        """Extract structured anomaly records from the agent response."""
+        """Extract structured anomaly records from the agent response.
+
+        The agent is instructed to append a ``json`` fenced code block
+        containing all anomalies.  This method parses that block first.  If no
+        valid JSON block is present (e.g., an older prompt or truncated
+        response), it falls back to lightweight keyword matching so that
+        *something* is always returned rather than an empty list.
+        """
+        # --- Primary path: parse the JSON code block emitted by the agent ---
+        json_block_re = re.compile(
+            r"```json\s*(\[.*?\])\s*```", re.DOTALL | re.IGNORECASE
+        )
+        match = json_block_re.search(response)
+        if match:
+            try:
+                records = json.loads(match.group(1))
+                if isinstance(records, list):
+                    valid: list[dict[str, Any]] = []
+                    valid_severities = {"critical", "high", "medium", "low"}
+                    for item in records:
+                        if not isinstance(item, dict):
+                            continue
+                        severity = str(item.get("severity", "")).lower()
+                        if severity not in valid_severities:
+                            continue
+                        valid.append(
+                            {
+                                "severity": severity,
+                                "document_type": str(item.get("document_type", "general")),
+                                "affected": str(item.get("affected", "")),
+                                "description": str(item.get("description", "")),
+                                "recommended_action": str(
+                                    item.get("recommended_action", "")
+                                ),
+                            }
+                        )
+                    return valid
+            except (json.JSONDecodeError, TypeError):
+                pass  # fall through to keyword fallback
+
+        # --- Fallback: lightweight keyword matching for backward compatibility ---
         anomalies: list[dict[str, Any]] = []
         severity_keywords = ["critical", "high", "medium", "low"]
         for line in response.splitlines():
             lower = line.lower()
             for severity in severity_keywords:
                 if f"**{severity}**" in lower or f"severity: {severity}" in lower:
-                    anomalies.append({"severity": severity, "description": line.strip(" -•*")})
+                    anomalies.append(
+                        {
+                            "severity": severity,
+                            "document_type": "general",
+                            "affected": "",
+                            "description": line.strip(" -•*"),
+                            "recommended_action": "",
+                        }
+                    )
                     break
         return anomalies

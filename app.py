@@ -109,8 +109,18 @@ def _render_results(result: AuditResult) -> None:
             st.write(f"**{len(result.anomalies)} anomalies detected**")
             for i, anomaly in enumerate(result.anomalies, start=1):
                 badge = _severity_badge(anomaly.get("severity", "unknown"))
-                with st.expander(f"Anomaly #{i} — {badge}", expanded=i <= 5):
+                doc_type = anomaly.get("document_type", "")
+                affected = anomaly.get("affected", "")
+                label_parts = [f"Anomaly #{i}", badge]
+                if doc_type:
+                    label_parts.append(f"· {doc_type.replace('_', ' ').title()}")
+                if affected:
+                    label_parts.append(f"· {affected}")
+                with st.expander(" ".join(label_parts), expanded=i <= 5):
                     st.write(anomaly.get("description", "No description available."))
+                    action = anomaly.get("recommended_action", "")
+                    if action:
+                        st.info(f"**Recommended action:** {action}")
         else:
             st.info("No structured anomaly records were extracted from the report. See the Full Report tab.")
 
