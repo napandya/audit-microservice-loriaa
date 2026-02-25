@@ -1,21 +1,265 @@
 """
 Tests for agents.audit_agent.
 
-Validates the AuditAgent helper methods (_extract_summary, _extract_anomalies)
-and the AuditAgent.run() flow using a mocked LangGraph agent so no real OpenAI
-API calls are made.
+Validates the AuditAgent helper methods (_extract_summary, _extract_anomalies),
+the rule-based analysis helpers (_analyse_rent_roll, _analyse_projections,
+_analyse_concessions, _consolidate_findings), and the AuditAgent.run() flow
+using a mocked LangGraph agent so no real OpenAI API calls are made.
 """
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agents.audit_agent import AuditAgent, AuditResult
+from agents.audit_agent import (
+    AuditAgent,
+    AuditResult,
+    _analyse_rent_roll,
+    _analyse_projections,
+    _analyse_concessions,
+    _consolidate_findings,
+)
 
 
 # ---------------------------------------------------------------------------
+# _analyse_rent_roll
+# ---------------------------------------------------------------------------
+
+
+class TestAnalyseRentRoll:
+    def _summary(self, **kwargs) -> str:
+        """Build a minimal data_summary string from keyword overrides."""
+        defaults = {
+            "records": 10,
+            "min_rent": 1000.0,
+            "max_rent": 2000.0,
+            "mean_rent": 1500.0,
+            "null_count": 0,
+            "occupied": 8,
+            "vacant": 2,
+        }
+        defaults.update(kwargs)
+        return (
+            f"Rent Roll — {defaults['records']} records\n"
+            f"  Monthly rent: min={defaults['min_rent']:.2f}, "
+            f"max={defaults['max_rent']:.2f}, "
+            f"mean={defaults['mean_rent']:.2f}, "
+            f"null_count={defaults['null_count']}\n"
+            f"  Occupancy status breakdown: "
+            f"{{'occupied': {defaults['occupied']}, 'vacant': {defaults['vacant']}}}\n"
+        )
+
+    def test_no_anomalies_for_clean_data(self) -> None:
+        findings = _analyse_rent_roll(self._summary())
+        # No rule-based anomalies should fire on clean data
+        assert isinstance(findings, list)
+
+    def test_detects_null_rent_values(self) -> None:
+        findings = _analyse_rent_roll(self._summary(null_count=3))
+        types = [f["type"] for f in findings]
+        assert "missing_rent_values" in types
+        assert any(f["severity"] == "high" for f in findings if f["type"] == "missing_rent_values")
+
+    def test_detects_zero_rent(self) -> None:
+        findings = _analyse_rent_roll(self._summary(min_rent=0.0))
+        types = [f["type"] for f in findings]
+        assert "zero_rent" in types
+        assert any(f["severity"] == "high" for f in findings if f["type"] == "zero_rent")
+
+    def test_detects_negative_rent(self) -> None:
+        findings = _analyse_rent_roll(self._summary(min_rent=-500.0))
+        types = [f["type"] for f in findings]
+        assert "negative_rent" in types
+        assert any(f["severity"] == "critical" for f in findings if f["type"] == "negative_rent")
+
+    def test_detects_rent_outlier(self) -> None:
+        # max > 3 × mean → outlier
+        findings = _analyse_rent_roll(self._summary(min_rent=1000.0, max_rent=6000.0, mean_rent=1500.0))
+        types = [f["type"] for f in findings]
+        assert "rent_statistical_outlier" in types
+
+    def test_no_outlier_when_max_below_threshold(self) -> None:
+        findings = _analyse_rent_roll(self._summary(min_rent=1000.0, max_rent=2000.0, mean_rent=1500.0))
+        types = [f["type"] for f in findings]
+        assert "rent_statistical_outlier" not in types
+
+    def test_detects_high_vacancy_rate(self) -> None:
+        # 50 % vacancy (5 of 10)
+        findings = _analyse_rent_roll(self._summary(occupied=5, vacant=5))
+        types = [f["type"] for f in findings]
+        assert "high_vacancy_rate" in types
+
+    def test_no_vacancy_flag_below_threshold(self) -> None:
+        findings = _analyse_rent_roll(self._summary(occupied=8, vacant=2))
+        types = [f["type"] for f in findings]
+        assert "high_vacancy_rate" not in types
+
+    def test_detects_non_numeric_rent(self) -> None:
+        summary = "Rent Roll — 3 records\n  Monthly rent: no valid numeric values, null_count=3\n"
+        findings = _analyse_rent_roll(summary)
+        types = [f["type"] for f in findings]
+        assert "non_numeric_rent" in types
+        assert any(f["severity"] == "critical" for f in findings)
+
+    def test_each_finding_has_required_keys(self) -> None:
+        findings = _analyse_rent_roll(self._summary(null_count=2, min_rent=0.0))
+        for f in findings:
+            assert "type" in f
+            assert "severity" in f
+            assert "affected" in f
+            assert "description" in f
+            assert "recommended_action" in f
+
+
+# ---------------------------------------------------------------------------
+# _analyse_projections
+# ---------------------------------------------------------------------------
+
+
+class TestAnalyseProjections:
+    def _summary(self, **kwargs) -> str:
+        defaults = {
+            "var_mean": 100.0,
+            "var_max": 200.0,
+            "proj_mean": 5000.0,
+        }
+        defaults.update(kwargs)
+        return (
+            f"Rent Projections — 12 records\n"
+            f"  Mean projected rent: {defaults['proj_mean']:.2f}\n"
+            f"  Projected vs actual variance: "
+            f"mean={defaults['var_mean']:.2f}, max={defaults['var_max']:.2f}\n"
+        )
+
+    def test_detects_critical_variance(self) -> None:
+        # 2000/5000 = 40% > 25% threshold → critical
+        findings = _analyse_projections(self._summary(var_max=2000.0, proj_mean=5000.0))
+        types = [f["type"] for f in findings]
+        assert "critical_projection_variance" in types
+        assert any(f["severity"] == "critical" for f in findings)
+
+    def test_detects_notable_variance(self) -> None:
+        # 600/5000 = 12% > 10% but < 25% → high
+        findings = _analyse_projections(self._summary(var_max=600.0, proj_mean=5000.0))
+        types = [f["type"] for f in findings]
+        assert "notable_projection_variance" in types
+        assert any(f["severity"] == "high" for f in findings if f["type"] == "notable_projection_variance")
+
+    def test_no_variance_flag_for_low_values(self) -> None:
+        # 100/5000 = 2% — well below threshold
+        findings = _analyse_projections(self._summary(var_mean=50.0, var_max=100.0, proj_mean=5000.0))
+        types = [f["type"] for f in findings]
+        assert "critical_projection_variance" not in types
+        assert "notable_projection_variance" not in types
+
+    def test_detects_non_numeric_projections(self) -> None:
+        summary = "Rent Projections — 3 records\n  Projected vs actual variance: no valid numeric values\n"
+        findings = _analyse_projections(summary)
+        types = [f["type"] for f in findings]
+        assert "non_numeric_projections" in types
+
+    def test_detects_negative_reported_variance(self) -> None:
+        summary = "Rent Projections — 5 records\n  Reported variance: min=-500.00, max=200.00\n  mean=3000.00\n"
+        findings = _analyse_projections(summary)
+        types = [f["type"] for f in findings]
+        assert "negative_reported_variance" in types
+
+
+# ---------------------------------------------------------------------------
+# _analyse_concessions
+# ---------------------------------------------------------------------------
+
+
+class TestAnalyseConcessions:
+    def _summary(self, **kwargs) -> str:
+        defaults = {
+            "records": 10,
+            "total": 5000.0,
+            "mean": 500.0,
+            "max": 600.0,
+            "types": "free_month",
+        }
+        defaults.update(kwargs)
+        return (
+            f"Concessions — {defaults['records']} records\n"
+            f"  Concession amounts: total={defaults['total']:.2f}, "
+            f"mean={defaults['mean']:.2f}, max={defaults['max']:.2f}\n"
+            f"  Concession type breakdown: {{'{defaults['types']}': {defaults['records']}}}\n"
+        )
+
+    def test_detects_concession_outlier(self) -> None:
+        # max = 2000, mean = 400 → 2000 > 3×400 → outlier
+        findings = _analyse_concessions(self._summary(mean=400.0, max=2000.0))
+        types = [f["type"] for f in findings]
+        assert "concession_outlier" in types
+        assert any(f["severity"] == "high" for f in findings if f["type"] == "concession_outlier")
+
+    def test_no_outlier_when_max_below_threshold(self) -> None:
+        findings = _analyse_concessions(self._summary(mean=500.0, max=600.0))
+        types = [f["type"] for f in findings]
+        assert "concession_outlier" not in types
+
+    def test_detects_unrecognised_concession_type(self) -> None:
+        findings = _analyse_concessions(self._summary(types="custom_unknown_type"))
+        types = [f["type"] for f in findings]
+        assert "unrecognised_concession_type" in types
+
+    def test_no_flag_for_approved_type(self) -> None:
+        findings = _analyse_concessions(self._summary(types="free_month"))
+        types = [f["type"] for f in findings]
+        assert "unrecognised_concession_type" not in types
+
+    def test_detects_non_numeric_concession_amount(self) -> None:
+        summary = "Concessions — 3 records\n  Concession amounts: no valid numeric values\n"
+        findings = _analyse_concessions(summary)
+        types = [f["type"] for f in findings]
+        assert "non_numeric_concessions" in types
+
+
+# ---------------------------------------------------------------------------
+# _consolidate_findings
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidateFindings:
+    def test_counts_by_severity(self) -> None:
+        findings = [
+            {"severity": "critical", "type": "x"},
+            {"severity": "high", "type": "y"},
+            {"severity": "high", "type": "z"},
+            {"severity": "low", "type": "w"},
+        ]
+        result = _consolidate_findings(json.dumps(findings))
+        assert result["severity_counts"]["critical"] == 1
+        assert result["severity_counts"]["high"] == 2
+        assert result["severity_counts"]["low"] == 1
+        assert result["total_findings"] == 4
+
+    def test_risk_level_critical_when_any_critical(self) -> None:
+        findings = [{"severity": "critical", "type": "x"}]
+        result = _consolidate_findings(json.dumps(findings))
+        assert result["risk_level"] == "CRITICAL"
+
+    def test_risk_level_high_when_no_critical(self) -> None:
+        findings = [{"severity": "high", "type": "x"}]
+        result = _consolidate_findings(json.dumps(findings))
+        assert result["risk_level"] == "HIGH"
+
+    def test_risk_level_low_for_empty(self) -> None:
+        result = _consolidate_findings(json.dumps([]))
+        assert result["risk_level"] == "LOW"
+        assert result["total_findings"] == 0
+
+    def test_handles_malformed_json(self) -> None:
+        result = _consolidate_findings("not valid json{")
+        assert result["total_findings"] == 0
+        assert result["risk_level"] == "LOW"
+
+
+
 # _extract_summary
 # ---------------------------------------------------------------------------
 

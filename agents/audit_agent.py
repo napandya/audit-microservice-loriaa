@@ -3,8 +3,10 @@ Audit agent module.
 
 Implements a LangGraph-based ReAct agent that audits rent roll, rent
 projections, and concessions data for anomalies.  The agent is powered by an
-OpenAI chat model and exposes a set of structured analysis tools that it can
-call autonomously before producing a final report.
+OpenAI chat model and exposes a set of structured analysis tools that perform
+**actual Python-based anomaly detection** on the data summaries, returning
+concrete findings as JSON.  The LLM then uses those findings to write the
+final professional audit report.
 """
 
 from __future__ import annotations
@@ -38,55 +40,430 @@ class AuditResult:
 
 
 # ---------------------------------------------------------------------------
+# Private rule-based analysis helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_float(pattern: str, text: str) -> Optional[float]:
+    """Return the first captured float from *text* matching *pattern*, or None."""
+    m = re.search(pattern, text)
+    return float(m.group(1)) if m else None
+
+
+def _parse_int(pattern: str, text: str) -> Optional[int]:
+    """Return the first captured int from *text* matching *pattern*, or None."""
+    m = re.search(pattern, text)
+    return int(m.group(1)) if m else None
+
+
+def _analyse_rent_roll(data_summary: str) -> list[dict[str, Any]]:
+    """Apply rule-based anomaly detection to a rent roll data summary string.
+
+    Checks applied
+    --------------
+    * Missing rent values (null_count > 0)
+    * Zero rent (min_rent == 0)
+    * Negative rent (min_rent < 0)
+    * Rent outlier (max_rent > 3 × mean_rent)
+    * Non-numeric rent column (no valid numeric values present)
+    * High vacancy rate (> 40 % of units vacant)
+    """
+    findings: list[dict[str, Any]] = []
+
+    # --- Non-numeric rent column ---
+    lower = data_summary.lower()
+    if (
+        "monthly rent: no valid numeric values" in lower
+        or ("no valid numeric values" in lower and "monthly rent" in lower)
+    ):
+        findings.append(
+            {
+                "type": "non_numeric_rent",
+                "severity": "critical",
+                "affected": "monthly_rent column",
+                "description": "The monthly_rent column contains no parseable numeric values.",
+                "recommended_action": (
+                    "Review the source file — the rent column may be incorrectly "
+                    "formatted or contain placeholder text."
+                ),
+            }
+        )
+        return findings  # further numeric checks meaningless
+
+    # --- Missing rent values ---
+    null_count = _parse_int(r"null_count=(\d+)", data_summary)
+    if null_count is not None and null_count > 0:
+        findings.append(
+            {
+                "type": "missing_rent_values",
+                "severity": "high",
+                "affected": f"{null_count} unit(s)",
+                "description": (
+                    f"{null_count} unit(s) have a missing or unparseable monthly_rent value."
+                ),
+                "recommended_action": (
+                    "Populate missing rent values before finalising the rent roll."
+                ),
+            }
+        )
+
+    # --- Zero rent ---
+    min_rent = _parse_float(r"Monthly rent: min=([-\d.]+)", data_summary)
+    if min_rent is not None:
+        if min_rent < 0:
+            findings.append(
+                {
+                    "type": "negative_rent",
+                    "severity": "critical",
+                    "affected": "One or more units",
+                    "description": (
+                        f"At least one unit has a negative monthly rent "
+                        f"(minimum detected: ${min_rent:,.2f})."
+                    ),
+                    "recommended_action": (
+                        "Investigate and correct negative rent values immediately — "
+                        "this indicates a data integrity issue."
+                    ),
+                }
+            )
+        elif min_rent == 0.0:
+            findings.append(
+                {
+                    "type": "zero_rent",
+                    "severity": "high",
+                    "affected": "One or more units",
+                    "description": "At least one unit has a monthly rent of $0.00.",
+                    "recommended_action": (
+                        "Verify whether zero-rent units are intentional (e.g. "
+                        "owner-occupied) or data entry errors."
+                    ),
+                }
+            )
+
+    # --- Rent outlier: max > 3 × mean ---
+    max_rent = _parse_float(r"max=([\d.]+), mean=", data_summary)
+    mean_rent = _parse_float(r"mean=([\d.]+), null_count=", data_summary)
+    if max_rent is not None and mean_rent is not None and mean_rent > 0:
+        if max_rent > 3 * mean_rent:
+            findings.append(
+                {
+                    "type": "rent_statistical_outlier",
+                    "severity": "medium",
+                    "affected": f"Unit with rent ${max_rent:,.2f}",
+                    "description": (
+                        f"Maximum rent (${max_rent:,.2f}) exceeds 3× the mean rent "
+                        f"(${mean_rent:,.2f}), indicating a statistical outlier."
+                    ),
+                    "recommended_action": (
+                        "Verify the highest rent amount is correct and not a data entry error."
+                    ),
+                }
+            )
+
+    # --- High vacancy rate ---
+    occ_m = re.search(r"Occupancy status breakdown: \{(.*?)\}", data_summary)
+    if occ_m:
+        status_text = occ_m.group(1)
+        occupied = _parse_int(r"'occupied':\s*(\d+)", status_text) or 0
+        vacant = _parse_int(r"'vacant':\s*(\d+)", status_text) or 0
+        total = occupied + vacant
+        if total > 0 and vacant / total > 0.40:
+            pct = 100 * vacant / total
+            findings.append(
+                {
+                    "type": "high_vacancy_rate",
+                    "severity": "medium",
+                    "affected": f"{vacant} of {total} units",
+                    "description": (
+                        f"Vacancy rate is {pct:.1f}% ({vacant}/{total} units), "
+                        "which is unusually high."
+                    ),
+                    "recommended_action": (
+                        "Investigate the cause of the high vacancy rate and review "
+                        "leasing strategy."
+                    ),
+                }
+            )
+
+    return findings
+
+
+def _analyse_projections(data_summary: str) -> list[dict[str, Any]]:
+    """Apply rule-based anomaly detection to a rent projections data summary.
+
+    Checks applied
+    --------------
+    * Mean projection variance > 10 % of mean projected rent → high
+    * Max projection variance > 25 % of mean projected rent → critical
+    * Non-numeric projection columns
+    * Reported variance column issues
+    """
+    findings: list[dict[str, Any]] = []
+    lower = data_summary.lower()
+
+    if "no valid numeric values" in lower and "projected" in lower:
+        findings.append(
+            {
+                "type": "non_numeric_projections",
+                "severity": "critical",
+                "affected": "projected_rent / actual_rent columns",
+                "description": "Projection columns contain no parseable numeric values.",
+                "recommended_action": "Check source file formatting for projection data.",
+            }
+        )
+        return findings
+
+    # --- Computed variance from mean/max of |actual - projected| ---
+    var_mean = _parse_float(r"Projected vs actual variance: mean=([\d.]+)", data_summary)
+    var_max = _parse_float(r"Projected vs actual variance: mean=[\d.]+, max=([\d.]+)", data_summary)
+
+    # Use mean projected rent as a reference denominator (added by DataProcessor)
+    proj_mean = _parse_float(r"Mean projected rent: ([\d.]+)", data_summary)
+
+    if var_max is not None and proj_mean and proj_mean > 0:
+        var_max_pct = 100 * var_max / proj_mean
+        if var_max_pct > 25:
+            findings.append(
+                {
+                    "type": "critical_projection_variance",
+                    "severity": "critical",
+                    "affected": "One or more periods",
+                    "description": (
+                        f"Maximum projection variance (${var_max:,.2f}, "
+                        f"{var_max_pct:.1f}% of mean projected rent) exceeds the "
+                        "25% critical threshold."
+                    ),
+                    "recommended_action": (
+                        "Immediately review periods with the largest divergence between "
+                        "projected and actual rent."
+                    ),
+                }
+            )
+        elif var_max_pct > 10:
+            findings.append(
+                {
+                    "type": "notable_projection_variance",
+                    "severity": "high",
+                    "affected": "One or more periods",
+                    "description": (
+                        f"Maximum projection variance (${var_max:,.2f}, "
+                        f"{var_max_pct:.1f}% of mean projected rent) exceeds the "
+                        "10% notable threshold."
+                    ),
+                    "recommended_action": (
+                        "Investigate periods where actual rent diverges significantly "
+                        "from projections."
+                    ),
+                }
+            )
+
+    if var_mean is not None and proj_mean and proj_mean > 0:
+        var_mean_pct = 100 * var_mean / proj_mean
+        if var_mean_pct > 10:
+            findings.append(
+                {
+                    "type": "elevated_mean_variance",
+                    "severity": "medium",
+                    "affected": "Across multiple periods",
+                    "description": (
+                        f"Mean projection variance (${var_mean:,.2f}, "
+                        f"{var_mean_pct:.1f}% of mean projected rent) is consistently elevated."
+                    ),
+                    "recommended_action": (
+                        "Review the projection methodology — systematic underestimation "
+                        "or overestimation is indicated."
+                    ),
+                }
+            )
+
+    # --- Reported variance column outliers ---
+    rep_min = _parse_float(r"Reported variance: min=([-\d.]+)", data_summary)
+    rep_max = _parse_float(r"Reported variance: min=[-\d.]+, max=([-\d.]+)", data_summary)
+    if rep_min is not None and rep_min < 0:
+        findings.append(
+            {
+                "type": "negative_reported_variance",
+                "severity": "high",
+                "affected": "One or more periods",
+                "description": (
+                    f"Reported variance contains a negative value (minimum: "
+                    f"${rep_min:,.2f}), which may indicate actual rent below projection."
+                ),
+                "recommended_action": (
+                    "Verify whether negative variance is expected or indicates "
+                    "a reporting error."
+                ),
+            }
+        )
+
+    return findings
+
+
+def _analyse_concessions(data_summary: str) -> list[dict[str, Any]]:
+    """Apply rule-based anomaly detection to a concessions data summary.
+
+    Checks applied
+    --------------
+    * Maximum concession > 3 × mean concession → statistical outlier
+    * Non-numeric concession_amount column
+    * High total concessions (> 10 % of records have max-level concession)
+    """
+    findings: list[dict[str, Any]] = []
+    lower = data_summary.lower()
+
+    if "no valid numeric values" in lower and "concession" in lower:
+        findings.append(
+            {
+                "type": "non_numeric_concessions",
+                "severity": "critical",
+                "affected": "concession_amount column",
+                "description": "The concession_amount column contains no parseable numeric values.",
+                "recommended_action": "Check source file formatting for concessions data.",
+            }
+        )
+        return findings
+
+    total = _parse_float(r"total=([\d.]+)", data_summary)
+    mean_c = _parse_float(r"mean=([\d.]+)", data_summary)
+    max_c = _parse_float(r"max=([\d.]+)", data_summary)
+    record_count = _parse_int(r"Concessions — (\d+) records", data_summary)
+
+    # --- Statistical outlier: max > 3 × mean ---
+    if max_c is not None and mean_c is not None and mean_c > 0:
+        if max_c > 3 * mean_c:
+            findings.append(
+                {
+                    "type": "concession_outlier",
+                    "severity": "high",
+                    "affected": f"Concession of ${max_c:,.2f}",
+                    "description": (
+                        f"Maximum concession (${max_c:,.2f}) is more than 3× the mean "
+                        f"(${mean_c:,.2f}), suggesting an unusually large concession."
+                    ),
+                    "recommended_action": (
+                        "Verify the largest concession has appropriate authorisation "
+                        "and justification."
+                    ),
+                }
+            )
+
+    # --- High total concession burden ---
+    if total is not None and mean_c is not None and record_count and record_count > 0:
+        avg_per_record = total / record_count
+        if mean_c > 0 and avg_per_record > 2 * mean_c:
+            findings.append(
+                {
+                    "type": "high_concession_burden",
+                    "severity": "medium",
+                    "affected": f"All {record_count} concession records",
+                    "description": (
+                        f"Average concession per record (${avg_per_record:,.2f}) "
+                        "suggests a heavy overall concession burden."
+                    ),
+                    "recommended_action": (
+                        "Review the concessions policy — the overall concession "
+                        "spend may be excessive relative to rent income."
+                    ),
+                }
+            )
+
+    # --- Unknown concession types ---
+    approved_types = {
+        "free_month", "discount", "reduced_rent", "move_in_special",
+        "lease_renewal", "referral", "seasonal",
+    }
+    type_m = re.search(r"Concession type breakdown: \{(.*?)\}", data_summary)
+    if type_m:
+        type_text = type_m.group(1)
+        found_types = re.findall(r"'([^']+)':\s*\d+", type_text)
+        unknown = [t for t in found_types if t.lower() not in approved_types]
+        if unknown:
+            findings.append(
+                {
+                    "type": "unrecognised_concession_type",
+                    "severity": "medium",
+                    "affected": ", ".join(unknown),
+                    "description": (
+                        f"Concession type(s) not in the approved list detected: "
+                        f"{', '.join(unknown)}."
+                    ),
+                    "recommended_action": (
+                        "Confirm these concession types are authorised and update "
+                        "the approved-types list if necessary."
+                    ),
+                }
+            )
+
+    return findings
+
+
+def _consolidate_findings(findings_json: str) -> dict[str, Any]:
+    """Parse the agent-supplied findings JSON and produce a consolidation summary."""
+    try:
+        all_findings: list[dict[str, Any]] = json.loads(findings_json)
+        if not isinstance(all_findings, list):
+            all_findings = []
+    except (json.JSONDecodeError, TypeError):
+        all_findings = []
+
+    counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for item in all_findings:
+        sev = str(item.get("severity", "")).lower()
+        if sev in counts:
+            counts[sev] += 1
+
+    return {
+        "total_findings": len(all_findings),
+        "severity_counts": counts,
+        "findings": all_findings,
+        "risk_level": (
+            "CRITICAL" if counts["critical"] > 0
+            else "HIGH" if counts["high"] > 0
+            else "MEDIUM" if counts["medium"] > 0
+            else "LOW"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # LangChain tools available to the agent
 # ---------------------------------------------------------------------------
 
 
 @tool
 def identify_rent_roll_anomalies(data_summary: str) -> str:
-    """Analyse a rent roll data summary and identify anomalies.
+    """Perform Python-based anomaly detection on rent roll data.
 
-    Checks for: missing required fields, units with zero or negative rent,
-    duplicate unit IDs, expired leases still marked as occupied, and
-    statistical outliers in rent amounts.
+    Applies rule-based checks to the structured data summary and returns
+    a JSON list of concrete findings.  Checks include: missing rent values,
+    zero or negative rent, statistical outliers (max > 3× mean), and
+    unusually high vacancy rates.
 
     Parameters
     ----------
     data_summary:
-        The textual summary / raw content of the rent roll data.
+        The textual summary / raw content of the rent roll data produced by
+        the data processor.
 
     Returns
     -------
     str
-        A JSON-formatted list of anomaly findings.
+        A JSON object with a ``findings`` list of detected anomalies, each
+        with ``type``, ``severity``, ``affected``, ``description``, and
+        ``recommended_action`` keys.
     """
-    # This tool's docstring guides the LLM. The agent itself will reason over
-    # data_summary and produce the analysis in its chain-of-thought; the tool
-    # return value signals back to the orchestration layer.
-    return json.dumps(
-        {
-            "tool": "identify_rent_roll_anomalies",
-            "input_received": True,
-            "instruction": (
-                "Carefully examine the rent roll data for: "
-                "1) missing or null values in critical fields (unit_id, tenant_name, monthly_rent, lease dates), "
-                "2) units with zero, negative, or unrealistically low/high rent amounts, "
-                "3) duplicate unit IDs, "
-                "4) lease end dates in the past for units still marked occupied, "
-                "5) statistical outliers (rent > 3 std devs from mean), "
-                "6) units with no tenant but marked as occupied. "
-                "Report each anomaly with: type, affected_unit/row, description, severity (low/medium/high/critical)."
-            ),
-        }
-    )
+    findings = _analyse_rent_roll(data_summary)
+    return json.dumps({"document_type": "rent_roll", "findings": findings})
 
 
 @tool
 def identify_projection_anomalies(data_summary: str) -> str:
-    """Analyse rent projection data and identify anomalies.
+    """Perform Python-based anomaly detection on rent projection data.
 
-    Checks for: large variances between projected and actual rent, missing
-    periods, inconsistent growth rates, and negative projections.
+    Applies rule-based checks and returns a JSON list of concrete findings.
+    Checks include: variance > 10 % (notable) or > 25 % (critical) of mean
+    projected rent, elevated mean variance across periods, and negative
+    reported variance values.
 
     Parameters
     ----------
@@ -96,32 +473,19 @@ def identify_projection_anomalies(data_summary: str) -> str:
     Returns
     -------
     str
-        A JSON-formatted list of anomaly findings.
+        A JSON object with a ``findings`` list of detected anomalies.
     """
-    return json.dumps(
-        {
-            "tool": "identify_projection_anomalies",
-            "input_received": True,
-            "instruction": (
-                "Carefully examine the rent projection data for: "
-                "1) large variance between projected and actual rent (>10% is notable, >25% is critical), "
-                "2) missing periods in the projection timeline, "
-                "3) inconsistent month-over-month growth rates, "
-                "4) negative projected or actual rent values, "
-                "5) periods where actual rent dramatically exceeds projections without explanation. "
-                "Report each anomaly with: type, affected_period, description, severity."
-            ),
-        }
-    )
+    findings = _analyse_projections(data_summary)
+    return json.dumps({"document_type": "projections", "findings": findings})
 
 
 @tool
 def identify_concession_anomalies(data_summary: str) -> str:
-    """Analyse concessions data and identify anomalies.
+    """Perform Python-based anomaly detection on concessions data.
 
-    Checks for: unapproved or missing approval records, unusually large
-    concessions, duplicate concessions for the same unit, concessions
-    exceeding monthly rent, and missing justification/reason fields.
+    Applies rule-based checks and returns a JSON list of concrete findings.
+    Checks include: statistical outliers (max concession > 3× mean), high
+    total concession burden, and unrecognised concession types.
 
     Parameters
     ----------
@@ -131,55 +495,35 @@ def identify_concession_anomalies(data_summary: str) -> str:
     Returns
     -------
     str
-        A JSON-formatted list of anomaly findings.
+        A JSON object with a ``findings`` list of detected anomalies.
     """
-    return json.dumps(
-        {
-            "tool": "identify_concession_anomalies",
-            "input_received": True,
-            "instruction": (
-                "Carefully examine the concessions data for: "
-                "1) concession amounts that exceed the unit's monthly rent, "
-                "2) multiple concessions for the same unit in the same period, "
-                "3) missing or blank 'approved_by' field (unapproved concessions), "
-                "4) missing reason/justification for a concession, "
-                "5) concession amounts that are statistical outliers (>3 std devs), "
-                "6) concession types that are unusual or not in an approved list. "
-                "Report each anomaly with: type, affected_unit/row, description, severity."
-            ),
-        }
-    )
+    findings = _analyse_concessions(data_summary)
+    return json.dumps({"document_type": "concessions", "findings": findings})
 
 
 @tool
 def generate_audit_report(findings_json: str) -> str:
-    """Consolidate all anomaly findings into a final audit report.
+    """Consolidate all anomaly findings into a structured audit report summary.
+
+    Parses the JSON findings collected from the prior analysis tools, counts
+    anomalies by severity, and returns a structured consolidation object that
+    the agent uses to compose the final markdown report.
 
     Parameters
     ----------
     findings_json:
-        A JSON string containing all anomaly findings from prior tool calls.
+        A JSON array string of all anomaly findings gathered from prior tool
+        calls.
 
     Returns
     -------
     str
-        A structured markdown audit report.
+        A JSON object containing ``total_findings``, ``severity_counts``,
+        ``risk_level``, and the full ``findings`` list — ready for the agent
+        to format into the final report.
     """
-    return json.dumps(
-        {
-            "tool": "generate_audit_report",
-            "input_received": True,
-            "instruction": (
-                "Using the findings provided, generate a comprehensive audit report in markdown. "
-                "The report should include: "
-                "1) Executive Summary with total anomaly counts by severity, "
-                "2) Detailed Findings section grouped by document type (rent roll / projections / concessions), "
-                "3) Risk Assessment highlighting the most critical issues, "
-                "4) Recommended Actions for each finding. "
-                "Format the output clearly so it can be rendered in a Streamlit markdown component."
-            ),
-        }
-    )
+    consolidation = _consolidate_findings(findings_json)
+    return json.dumps(consolidation)
 
 
 # ---------------------------------------------------------------------------
@@ -190,13 +534,19 @@ _SYSTEM_PROMPT = """You are an expert real-estate audit AI agent specialising in
 identifying anomalies in rent rolls, rent projections, and concessions data. \
 Your goal is to perform a thorough, systematic audit of the provided documents.
 
+The tools available to you perform **actual Python-based anomaly detection** and \
+return concrete findings as JSON — they are not just instructions.  You MUST use \
+their output as the factual basis for your report.
+
 When given document content, you MUST:
 1. Call `identify_rent_roll_anomalies` if rent roll data is present.
 2. Call `identify_projection_anomalies` if rent projection data is present.
 3. Call `identify_concession_anomalies` if concessions data is present.
-4. Call `generate_audit_report` to consolidate all findings into a final report.
+4. Call `generate_audit_report` with ALL the findings from steps 1–3 as a JSON array.
+5. Write a comprehensive markdown audit report that incorporates the tool findings \
+AND any additional qualitative issues you observe in the data.
 
-For each anomaly you discover, classify it with a severity level:
+For each anomaly, classify it with a severity level:
 - **critical**: Requires immediate action (e.g., financial fraud indicators, data integrity failures)
 - **high**: Significant issue that needs prompt resolution
 - **medium**: Notable issue that should be investigated
@@ -206,7 +556,8 @@ Be thorough, precise, and professional. Format your final report in clear markdo
 
 IMPORTANT — Structured anomaly output:
 After your full markdown report, append a fenced JSON code block containing every
-anomaly as a list of objects.  The block MUST follow this exact schema:
+anomaly (from both tool findings AND any additional issues you identified) as a
+list of objects.  The block MUST follow this exact schema:
 
 ```json
 [

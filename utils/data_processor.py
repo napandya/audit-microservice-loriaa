@@ -132,6 +132,11 @@ class DataProcessor:
             proj = pd.to_numeric(df["projected_rent"], errors="coerce")
             actual = pd.to_numeric(df["actual_rent"], errors="coerce")
             computed_variance = (actual - proj).abs().dropna()
+            valid_proj = proj.dropna()
+            if valid_proj.empty:
+                lines.append("  Mean projected rent: no valid numeric values")
+            else:
+                lines.append(f"  Mean projected rent: {valid_proj.mean():.2f}")
             if computed_variance.empty:
                 lines.append("  Projected vs actual variance: no valid numeric values")
             else:
