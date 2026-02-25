@@ -11,6 +11,7 @@ Run with:
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
@@ -20,6 +21,8 @@ from dotenv import load_dotenv
 from agents.audit_agent import AuditAgent, AuditResult
 from parsers.document_parser import DocumentParser, ParsedDocument
 from utils.data_processor import DataProcessor
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Initialisation
@@ -55,7 +58,8 @@ def _parse_uploaded_file(
     try:
         raw_bytes = uploaded_file.read()
         return parser.parse(raw_bytes, uploaded_file.name)
-    except Exception as exc:  # noqa: BLE001
+    except (ValueError, IOError, KeyError, RuntimeError) as exc:
+        logger.exception("Failed to parse file '%s'", uploaded_file.name)
         st.error(f"❌ Failed to parse **{uploaded_file.name}**: {exc}")
         return None
 
@@ -277,18 +281,19 @@ def main() -> None:
         type="primary",
         use_container_width=True,
     ):
-        os.environ["OPENAI_API_KEY"] = api_key
-
         with st.spinner("🤖 AI agent is analysing your documents… this may take a moment."):
             try:
-                agent = AuditAgent()
+                # Pass the API key directly to the agent to avoid storing it
+                # in os.environ where it could be read by other code.
+                agent = AuditAgent(api_key=api_key)
                 result = agent.run(
                     rent_roll_content=rent_roll_content,
                     projections_content=projections_content,
                     concessions_content=concessions_content,
                 )
                 st.session_state["audit_result"] = result
-            except Exception as exc:  # noqa: BLE001
+            except (ValueError, RuntimeError, ConnectionError) as exc:
+                logger.exception("Audit run failed")
                 st.error(f"❌ Audit failed: {exc}")
                 st.session_state.pop("audit_result", None)
 

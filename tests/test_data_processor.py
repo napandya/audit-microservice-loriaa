@@ -73,6 +73,28 @@ class TestSummariseRentRoll:
         result = processor.summarise_rent_roll(df)
         assert "5 records" in result
 
+    def test_all_non_numeric_rent_values_handled_gracefully(
+        self, processor: DataProcessor
+    ) -> None:
+        # All values are non-numeric; pd.to_numeric(..., errors="coerce") will
+        # produce an all-NaN Series. This should not raise.
+        df = pd.DataFrame(
+            {
+                "monthly_rent": ["N/A", "unknown", "not available"],
+                "unit_id": ["U1", "U2", "U3"],
+            }
+        )
+        result = processor.summarise_rent_roll(df)
+        assert isinstance(result, str)
+        assert "no valid numeric values" in result
+
+    def test_all_non_numeric_sqft_values_handled_gracefully(
+        self, processor: DataProcessor
+    ) -> None:
+        df = pd.DataFrame({"sq_ft": ["n/a", "?", "unknown"]})
+        result = processor.summarise_rent_roll(df)
+        assert "no valid numeric values" in result
+
 
 # ---------------------------------------------------------------------------
 # summarise_rent_projections
@@ -110,6 +132,22 @@ class TestSummariseRentProjections:
         # Should not raise; columns should be normalised
         assert isinstance(result, str)
 
+    def test_all_non_numeric_projected_rent_handled_gracefully(
+        self, processor: DataProcessor
+    ) -> None:
+        df = pd.DataFrame(
+            {"projected_rent": ["N/A", "?"], "actual_rent": ["N/A", "?"]}
+        )
+        result = processor.summarise_rent_projections(df)
+        assert "no valid numeric values" in result
+
+    def test_all_non_numeric_variance_handled_gracefully(
+        self, processor: DataProcessor
+    ) -> None:
+        df = pd.DataFrame({"variance": ["N/A", "unknown"]})
+        result = processor.summarise_rent_projections(df)
+        assert "no valid numeric values" in result
+
     def test_none_returns_no_data_message(self, processor: DataProcessor) -> None:
         result = processor.summarise_rent_projections(None)
         assert "No structured" in result
@@ -144,6 +182,13 @@ class TestSummariseConcessions:
         df = pd.DataFrame({"discount": [50, 75]})
         result = processor.summarise_concessions(df)
         assert "total=" in result
+
+    def test_all_non_numeric_concession_amounts_handled_gracefully(
+        self, processor: DataProcessor
+    ) -> None:
+        df = pd.DataFrame({"concession_amount": ["N/A", "unknown", "n/a"]})
+        result = processor.summarise_concessions(df)
+        assert "no valid numeric values" in result
 
     def test_type_breakdown_present(self, processor: DataProcessor) -> None:
         df = pd.DataFrame(

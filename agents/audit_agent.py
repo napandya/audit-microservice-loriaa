@@ -214,21 +214,30 @@ class AuditAgent:
         variable, falling back to ``"gpt-4o"``.
     max_tokens:
         Maximum tokens for LLM responses. Defaults to the
-        ``OPENAI_MAX_TOKENS`` environment variable, falling back to ``4096``.
+        ``OPENAI_MAX_TOKENS`` environment variable, falling back to ``8192``.
+        GPT-4o supports a 128 k-token context window; 8192 output tokens
+        gives ample room for comprehensive audit reports while avoiding
+        mid-sentence truncation.
+    api_key:
+        OpenAI API key. When supplied, it is passed directly to the
+        ``ChatOpenAI`` client rather than being read from the environment,
+        keeping the key out of ``os.environ``.
     """
 
     def __init__(
         self,
         model: Optional[str] = None,
         max_tokens: Optional[int] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         model_name = model or os.getenv("OPENAI_MODEL", "gpt-4o")
-        token_limit = max_tokens or int(os.getenv("OPENAI_MAX_TOKENS", "4096"))
+        token_limit = max_tokens or int(os.getenv("OPENAI_MAX_TOKENS", "8192"))
 
         llm = ChatOpenAI(
             model=model_name,
             max_tokens=token_limit,
             temperature=0,
+            api_key=api_key or None,
         )
         tools = [
             identify_rent_roll_anomalies,

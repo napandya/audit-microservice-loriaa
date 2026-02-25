@@ -87,12 +87,19 @@ class DataProcessor:
 
         if "monthly_rent" in df.columns:
             rent_series = pd.to_numeric(df["monthly_rent"], errors="coerce")
-            lines.append(
-                f"  Monthly rent: min={rent_series.min():.2f}, "
-                f"max={rent_series.max():.2f}, "
-                f"mean={rent_series.mean():.2f}, "
-                f"null_count={rent_series.isna().sum()}"
-            )
+            valid = rent_series.dropna()
+            if valid.empty:
+                lines.append(
+                    f"  Monthly rent: no valid numeric values, "
+                    f"null_count={rent_series.isna().sum()}"
+                )
+            else:
+                lines.append(
+                    f"  Monthly rent: min={valid.min():.2f}, "
+                    f"max={valid.max():.2f}, "
+                    f"mean={valid.mean():.2f}, "
+                    f"null_count={rent_series.isna().sum()}"
+                )
 
         if "occupancy_status" in df.columns:
             status_counts = df["occupancy_status"].value_counts().to_dict()
@@ -100,9 +107,14 @@ class DataProcessor:
 
         if "sq_ft" in df.columns:
             sqft = pd.to_numeric(df["sq_ft"], errors="coerce")
-            lines.append(
-                f"  Sq ft: min={sqft.min():.0f}, max={sqft.max():.0f}"
-            )
+            min_sqft = sqft.min()
+            max_sqft = sqft.max()
+            if pd.isna(min_sqft) or pd.isna(max_sqft):
+                lines.append("  Sq ft: no valid numeric values")
+            else:
+                lines.append(
+                    f"  Sq ft: min={min_sqft:.0f}, max={max_sqft:.0f}"
+                )
 
         lines.append(f"  Columns present: {list(df.columns)}")
         lines.append(f"\nFull data sample (first 20 rows):\n{df.head(20).to_string(index=False)}")
@@ -119,19 +131,25 @@ class DataProcessor:
         if "projected_rent" in df.columns and "actual_rent" in df.columns:
             proj = pd.to_numeric(df["projected_rent"], errors="coerce")
             actual = pd.to_numeric(df["actual_rent"], errors="coerce")
-            computed_variance = (actual - proj).abs()
-            lines.append(
-                f"  Projected vs actual variance: "
-                f"mean={computed_variance.mean():.2f}, "
-                f"max={computed_variance.max():.2f}"
-            )
+            computed_variance = (actual - proj).abs().dropna()
+            if computed_variance.empty:
+                lines.append("  Projected vs actual variance: no valid numeric values")
+            else:
+                lines.append(
+                    f"  Projected vs actual variance: "
+                    f"mean={computed_variance.mean():.2f}, "
+                    f"max={computed_variance.max():.2f}"
+                )
 
         if "variance" in df.columns:
-            var_series = pd.to_numeric(df["variance"], errors="coerce")
-            lines.append(
-                f"  Reported variance: "
-                f"min={var_series.min():.2f}, max={var_series.max():.2f}"
-            )
+            var_series = pd.to_numeric(df["variance"], errors="coerce").dropna()
+            if var_series.empty:
+                lines.append("  Reported variance: no valid numeric values")
+            else:
+                lines.append(
+                    f"  Reported variance: "
+                    f"min={var_series.min():.2f}, max={var_series.max():.2f}"
+                )
 
         lines.append(f"  Columns present: {list(df.columns)}")
         lines.append(f"\nFull data sample (first 20 rows):\n{df.head(20).to_string(index=False)}")
@@ -147,11 +165,15 @@ class DataProcessor:
 
         if "concession_amount" in df.columns:
             amounts = pd.to_numeric(df["concession_amount"], errors="coerce")
-            lines.append(
-                f"  Concession amounts: total={amounts.sum():.2f}, "
-                f"mean={amounts.mean():.2f}, "
-                f"max={amounts.max():.2f}"
-            )
+            valid_amounts = amounts.dropna()
+            if valid_amounts.empty:
+                lines.append("  Concession amounts: no valid numeric values")
+            else:
+                lines.append(
+                    f"  Concession amounts: total={valid_amounts.sum():.2f}, "
+                    f"mean={valid_amounts.mean():.2f}, "
+                    f"max={valid_amounts.max():.2f}"
+                )
 
         if "concession_type" in df.columns:
             type_counts = df["concession_type"].value_counts().to_dict()
